@@ -11,6 +11,10 @@ import { Spinner } from '@/components/ui/spinner'
 
 const SESSION_KEY = 'forge.v1'
 const APP_URL_KEY = 'forge.appUrl'
+const PUBLIC_APP_URL = 'https://clone-github-repository-three.vercel.app'
+const PREVIOUS_APP_URLS = new Set(['https://zero-labs-nine.vercel.app'])
+
+type LaptopPlatform = 'windows' | 'unix'
 
 function normalizeOrigin(value: string) {
   const trimmed = value.trim().replace(/\/+$/, '')
@@ -60,13 +64,17 @@ export function PairingScreen() {
   const [origin, setOrigin] = useState('')
   const [appUrl, setAppUrl] = useState('')
   const [urlDraft, setUrlDraft] = useState('')
+  const [platform, setPlatform] = useState<LaptopPlatform>('unix')
 
   useEffect(() => {
     const current = window.location.origin
     setOrigin(current)
+    setPlatform(/Windows/i.test(navigator.userAgent) ? 'windows' : 'unix')
     const saved = normalizeOrigin(localStorage.getItem(APP_URL_KEY) || '')
-    setAppUrl(saved || current)
-    setUrlDraft(saved || current)
+    const initialUrl = saved && !PREVIOUS_APP_URLS.has(saved) ? saved : PUBLIC_APP_URL
+    setAppUrl(initialUrl)
+    setUrlDraft(initialUrl)
+    localStorage.setItem(APP_URL_KEY, initialUrl)
     const existing = readSession()
     if (existing?.code && existing.phoneSecret) {
       setSession(existing)
@@ -147,8 +155,11 @@ export function PairingScreen() {
 
   const command = useMemo(() => {
     if (!appUrl || !session?.code) return ''
+    if (platform === 'windows') {
+      return `$installer = Join-Path $env:TEMP 'forge-install.ps1'; try { Invoke-RestMethod '${appUrl}/install.ps1' -OutFile $installer; & $installer '${session.code}' } catch { Write-Error "Installer failed — is ${appUrl} public? $($_.Exception.Message)" }`
+    }
     return `curl -fsSL ${appUrl}/install -o /tmp/forge-install.sh && grep -q '^#!/usr/bin/env bash' /tmp/forge-install.sh && bash /tmp/forge-install.sh ${session.code} || echo "Installer fetch failed — is ${appUrl} public?"`
-  }, [appUrl, session?.code])
+  }, [appUrl, platform, session?.code])
 
   function commitAppUrl() {
     const next = normalizeOrigin(urlDraft)
@@ -216,6 +227,7 @@ export function PairingScreen() {
           onChange={(event) => setUrlDraft(event.target.value)}
           onBlur={commitAppUrl}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return
             if (event.key === 'Enter') commitAppUrl()
           }}
           spellCheck={false}
@@ -240,12 +252,32 @@ export function PairingScreen() {
       </section>
 
       <section className="flex flex-col gap-3">
-        <div className="flex items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="text-xs tracking-wide text-muted-foreground uppercase">Laptop command</p>
-          <Button size="sm" variant="outline" onClick={copyCommand} disabled={!command}>
-            {copied ? <CheckIcon data-icon="inline-start" /> : <CopyIcon data-icon="inline-start" />}
-            {copied ? 'Copied' : 'Copy'}
-          </Button>
+          <div className="flex items-center gap-2">
+            <div className="flex rounded-lg bg-muted p-1" aria-label="Laptop operating system">
+              <Button
+                size="sm"
+                variant={platform === 'windows' ? 'secondary' : 'ghost'}
+                onClick={() => setPlatform('windows')}
+                aria-pressed={platform === 'windows'}
+              >
+                Windows
+              </Button>
+              <Button
+                size="sm"
+                variant={platform === 'unix' ? 'secondary' : 'ghost'}
+                onClick={() => setPlatform('unix')}
+                aria-pressed={platform === 'unix'}
+              >
+                macOS / Linux
+              </Button>
+            </div>
+            <Button size="sm" variant="outline" onClick={copyCommand} disabled={!command}>
+              {copied ? <CheckIcon data-icon="inline-start" /> : <CopyIcon data-icon="inline-start" />}
+              {copied ? 'Copied' : 'Copy'}
+            </Button>
+          </div>
         </div>
         <pre className="overflow-x-auto rounded-xl bg-card p-4 font-mono text-[12px] leading-relaxed text-foreground ring-1 ring-foreground/10">
           <code>{command || 'Creating pairing code…'}</code>
