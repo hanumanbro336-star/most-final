@@ -1,0 +1,17 @@
+name = "forge-relay"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "forge-relay"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[[durable_objects.bindings]]
+name = "DEVICE_RELAY"
+class_name = "DeviceRelay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DeviceRelay"]
