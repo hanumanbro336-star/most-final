@@ -1,127 +1,96 @@
 #!/usr/bin/env python3
-"""Forge bridge — laptop dials out to the website, then proxies to local agentremoted."""
+"""Forge bridge: maintain one outbound WebSocket and proxy requests to agentremoted."""
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import ssl
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:
+    import websocket
+except ImportError:
+    sys.stderr.write("Missing websocket-client. Run: python -m pip install --user websocket-client\n")
+    raise SystemExit(1)
+
 CONFIG_PATH = Path(os.environ.get("FORGE_CONFIG", str(Path.home() / ".forge" / "config.json")))
-DAEMON_URL = "http://127.0.0.1:8473"
+DEFAULT_DAEMON_URL = "http://127.0.0.1:8473"
+MAX_RESPONSE_BYTES = 2_000_000
+STREAM_IDLE_SECONDS = 60
+STREAM_MAX_SECONDS = 60 * 60
+STREAM_MAX_BYTES = 64 * 1024 * 1024
+STREAM_CHUNK_BYTES = 16 * 1024
 
 
 def load_config():
     if not CONFIG_PATH.exists():
-        sys.stderr.write("Missing %s — run the install command from the website.\n" % CONFIG_PATH)
-        sys.exit(1)
-    return json.loads(CONFIG_PATH.read_text())
+        raise SystemExit("Missing %s — run the install command from the Forge website." % CONFIG_PATH)
+    try:
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise SystemExit("Could not read %s: %s" % (CONFIG_PATH, error))
+    missing = [key for key in ("relayUrl", "deviceId", "deviceToken") if not config.get(key)]
+    if missing:
+        raise SystemExit("Config missing %s — pair this laptop again." % ", ".join(missing))
+    return config
 
 
-def request(url, payload=None, headers=None, method=None, timeout=30):
+def http_request(url, payload=None, headers=None, method=None, timeout=30):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method or ("GET" if data is None else "POST"))
-    req.add_header("User-Agent", "forge-bridge/1.0")
+    request = urllib.request.Request(url, data=data, method=method or ("GET" if data is None else "POST"))
+    request.add_header("User-Agent", "forge-bridge/2.0")
     if data is not None:
-        req.add_header("Content-Type", "application/json")
+        request.add_header("Content-Type", "application/json")
     for key, value in (headers or {}).items():
-        if key.lower() in ("host", "content-length", "connection"):
-            continue
-        req.add_header(key, value)
-    ctx = ssl.create_default_context()
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-        body = resp.read()
-        return resp.status, dict(resp.headers.items()), body
+        if key.lower() not in ("host", "content-length", "connection", "authorization", "cookie"):
+            request.add_header(key, value)
+    with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
+        body = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise ValueError("Local daemon response exceeded 2 MB")
+        return response.status, dict(response.headers.items()), body
 
 
-def daemon_token(cfg):
-    token = cfg.get("daemonToken")
-    if token:
-        return token
+def daemon_token(config):
+    if config.get("daemonToken"):
+        return config["daemonToken"]
     path = Path.home() / ".agentremoted" / "token"
-    if path.exists():
-        return path.read_text().strip()
-    return ""
-
-
-def ping_daemon(token):
     try:
-        status, _, body = request(
-            DAEMON_URL + "/api/ping",
-            headers={"X-Auth-Token": token} if token else None,
-            timeout=2,
-        )
-        return status < 500, body
-    except Exception:
-        return False, b""
+        return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+    except OSError:
+        return ""
 
 
-def run_job(job, token):
-    path = job.get("path") or "/"
-    query = job.get("query") or ""
-    url = DAEMON_URL + path + (("?" + query) if query else "")
-    method = (job.get("method") or "GET").upper()
-    headers = dict(job.get("headers") or {})
-    if token:
-        headers["X-Auth-Token"] = token
-    body = job.get("body")
-    data = None if body is None else (body.encode("utf-8") if isinstance(body, str) else body)
+def daemon_url(config):
+    return str(config.get("daemonUrl") or DEFAULT_DAEMON_URL).rstrip("/")
+
+
+def ping_daemon(config, token):
     try:
-        req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("User-Agent", "forge-bridge/1.0")
-        for key, value in headers.items():
-            if key.lower() in ("host", "content-length", "connection"):
-                continue
-            req.add_header(key, value)
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            raw = resp.read()
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                import base64
-
-                text = base64.b64encode(raw).decode("ascii")
-                hdrs = dict(resp.headers.items())
-                hdrs["X-Forge-Binary"] = "1"
-                return {
-                    "id": job["id"],
-                    "responseStatus": resp.status,
-                    "responseHeaders": hdrs,
-                    "responseBody": text,
-                }
-            return {
-                "id": job["id"],
-                "responseStatus": resp.status,
-                "responseHeaders": dict(resp.headers.items()),
-                "responseBody": text,
-            }
-    except urllib.error.HTTPError as err:
-        raw = err.read()
-        try:
-            text = raw.decode("utf-8")
-        except Exception:
-            text = ""
-        return {
-            "id": job["id"],
-            "responseStatus": err.code,
-            "responseHeaders": dict(err.headers.items()) if err.headers else {},
-            "responseBody": text,
-        }
-    except Exception as err:
-        return {"id": job["id"], "error": str(err), "responseStatus": 502}
-
-
-def jobs_snapshot(token):
-    try:
-        status, _, body = request(
-            DAEMON_URL + "/api/jobs",
+        status, _, _ = http_request(
+            daemon_url(config) + "/api/ping",
             headers={"X-Auth-Token": token} if token else None,
             timeout=3,
+        )
+        return status < 500
+    except Exception:
+        return False
+
+
+def jobs_snapshot(config, token):
+    try:
+        status, _, body = http_request(
+            daemon_url(config) + "/api/jobs",
+            headers={"X-Auth-Token": token} if token else None,
+            timeout=4,
         )
         if status >= 400:
             return {"active": []}
@@ -130,57 +99,189 @@ def jobs_snapshot(token):
             return {"active": parsed}
         if isinstance(parsed, dict):
             return {"active": parsed.get("jobs") or parsed.get("active") or []}
-        return {"active": []}
     except Exception:
-        return {"active": []}
+        pass
+    return {"active": []}
 
 
-def loop(cfg):
-    origin = cfg["origin"].rstrip("/")
-    device_id = cfg["deviceId"]
-    secret = cfg["laptopSecret"]
-    url = origin + "/api/devices/" + device_id + "/sync"
-    results = []
-    print("forge-bridge online → %s" % origin, flush=True)
-    print("waiting for the phone page to flip to connected (step 4)", flush=True)
-    while True:
-        token = daemon_token(cfg)
-        daemon_ok, _ = ping_daemon(token)
-        payload = {
-            "daemonOk": daemon_ok,
-            "status": jobs_snapshot(token) if daemon_ok else {"active": []},
-            "results": results,
-        }
+def run_job(job, config, token, emit=None):
+    job_id = str(job.get("id") or "")
+    path = str(job.get("path") or "/")
+    if not path.startswith("/") or path.startswith("/internal"):
+        return {"type": "result", "id": job_id, "error": "Forbidden local path", "responseStatus": 403}
+    query = str(job.get("query") or "")
+    url = daemon_url(config) + path + (("?" + query) if query else "")
+    method = str(job.get("method") or "GET").upper()
+    if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
+        return {"type": "result", "id": job_id, "error": "Unsupported method", "responseStatus": 405}
+
+    headers = {}
+    for key, value in dict(job.get("headers") or {}).items():
+        if str(key).lower() not in ("host", "content-length", "connection", "authorization", "cookie"):
+            headers[str(key)] = str(value)
+    if token:
+        headers["X-Auth-Token"] = token
+    body = job.get("body")
+    data = None if body is None else str(body).encode("utf-8")
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("User-Agent", "forge-bridge/2.0")
+    for key, value in headers.items():
+        request.add_header(key, value)
+
+    try:
+        response = urllib.request.urlopen(request, timeout=STREAM_IDLE_SECONDS)
+    except urllib.error.HTTPError as error:
+        response = error
+    except Exception as error:
+        return {"type": "result", "id": job_id, "error": str(error), "responseStatus": 502}
+
+    with response:
+        response_headers = dict(response.headers.items())
+        content_type = str(response.headers.get("content-type") or "").lower()
+        should_stream = emit is not None and (
+            "text/event-stream" in content_type or
+            str(response.headers.get("transfer-encoding") or "").lower() == "chunked")
+        if should_stream:
+            emit({"type": "stream_start", "id": job_id,
+                  "responseStatus": response.status,
+                  "responseHeaders": response_headers})
+            started = time.monotonic()
+            streamed_bytes = 0
+            reader = getattr(response, "read1", response.read)
+            while True:
+                if time.monotonic() - started > STREAM_MAX_SECONDS:
+                    raise RuntimeError("Local daemon stream exceeded one hour")
+                chunk = reader(STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                streamed_bytes += len(chunk)
+                if streamed_bytes > STREAM_MAX_BYTES:
+                    raise RuntimeError("Local daemon stream exceeded 64 MB")
+                emit({"type": "stream_chunk", "id": job_id,
+                      "encoding": "base64",
+                      "data": base64.b64encode(chunk).decode("ascii")})
+            emit({"type": "stream_end", "id": job_id})
+            return None
+
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ValueError("Local daemon response exceeded 2 MB")
         try:
-            _, _, body = request(
-                url,
-                payload=payload,
-                headers={"Authorization": "Bearer " + secret},
-                timeout=30,
+            response_body = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            response_body = base64.b64encode(raw).decode("ascii")
+            response_headers["X-Forge-Binary"] = "1"
+        return {"type": "result", "id": job_id,
+                "responseStatus": response.status,
+                "responseHeaders": response_headers,
+                "responseBody": response_body}
+
+
+def websocket_url(config):
+    base = str(config["relayUrl"]).rstrip("/")
+    parsed = urllib.parse.urlparse(base)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    query = urllib.parse.urlencode({"deviceId": config["deviceId"]})
+    return urllib.parse.urlunparse((scheme, parsed.netloc, "/v1/device/connect", "", query, ""))
+
+
+class Bridge:
+    def __init__(self, config):
+        self.config = config
+        self.socket = None
+        self.stop_event = threading.Event()
+        self.send_lock = threading.Lock()
+        self.heartbeat_thread = None
+
+    def send(self, payload):
+        raw = json.dumps(payload, separators=(",", ":"))
+        with self.send_lock:
+            if self.socket and self.socket.sock and self.socket.sock.connected:
+                self.socket.send(raw)
+
+    def status_payload(self, message_type="heartbeat"):
+        token = daemon_token(self.config)
+        ok = ping_daemon(self.config, token)
+        return {
+            "type": message_type,
+            "daemonOk": ok,
+            "status": jobs_snapshot(self.config, token) if ok else {"active": []},
+        }
+
+    def on_open(self, socket):
+        self.socket = socket
+        self.stop_event.clear()
+        print("forge-bridge connected", flush=True)
+        self.send(self.status_payload("hello"))
+        self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
+        self.heartbeat_thread.start()
+
+    def on_message(self, _socket, raw):
+        try:
+            message = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if message.get("type") != "rpc" or not message.get("id"):
+            return
+        threading.Thread(target=self.execute_job, args=(message,), daemon=True).start()
+
+    def execute_job(self, job):
+        token = daemon_token(self.config)
+        started_stream = [False]
+
+        def emit(payload):
+            if payload.get("type") == "stream_start":
+                started_stream[0] = True
+            self.send(payload)
+
+        try:
+            result = run_job(job, self.config, token, emit=emit)
+            if result is not None:
+                self.send(result)
+        except Exception as error:
+            self.send({
+                "type": "stream_error" if started_stream[0] else "result",
+                "id": str(job.get("id") or ""),
+                "error": str(error),
+                "responseStatus": 502,
+            })
+
+    def heartbeat_loop(self):
+        while not self.stop_event.wait(10):
+            try:
+                self.send(self.status_payload())
+            except Exception as error:
+                sys.stderr.write("heartbeat error: %s\n" % error)
+
+    def on_error(self, _socket, error):
+        sys.stderr.write("connection error: %s\n" % error)
+
+    def on_close(self, _socket, code, reason):
+        self.stop_event.set()
+        self.socket = None
+        print("forge-bridge disconnected (%s %s)" % (code or "", reason or ""), flush=True)
+
+    def run_forever(self):
+        delay = 1
+        while True:
+            app = websocket.WebSocketApp(
+                websocket_url(self.config),
+                header=["Authorization: Bearer " + self.config["deviceToken"]],
+                on_open=self.on_open,
+                on_message=self.on_message,
+                on_error=self.on_error,
+                on_close=self.on_close,
             )
-            data = json.loads(body.decode("utf-8") or "{}")
-            results = []
-            jobs = data.get("jobs") or []
-            if jobs:
-                print("rpc x%s" % len(jobs), flush=True)
-            for job in jobs:
-                results.append(run_job(job, token))
-            if not jobs:
-                time.sleep(0.2)
-        except Exception as err:
-            sys.stderr.write("sync error: %s\n" % err)
-            results = []
-            time.sleep(2)
+            app.run_forever(ping_interval=25, ping_timeout=10, sslopt={"cert_reqs": ssl.CERT_REQUIRED})
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
 
 
 def main():
-    cfg = load_config()
-    required = ("origin", "deviceId", "laptopSecret")
-    missing = [key for key in required if not cfg.get(key)]
-    if missing:
-        sys.stderr.write("config missing %s\n" % ", ".join(missing))
-        sys.exit(1)
-    loop(cfg)
+    websocket.enableTrace(False)
+    config = load_config()
+    print("forge-bridge starting for %s" % config["deviceId"], flush=True)
+    Bridge(config).run_forever()
 
 
 if __name__ == "__main__":
