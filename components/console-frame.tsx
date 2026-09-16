@@ -3,7 +3,9 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
+import { authClient } from '@/lib/auth-client'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 
 const SESSION_KEY = 'forge.v1'
 const PROFILE_KEY = 'agentremote.profiles'
@@ -16,7 +18,7 @@ type PairSession = {
   daemonOk?: boolean
 }
 
-export function ConsoleFrame() {
+export function ConsoleFrame({ email }: { email: string }) {
   const router = useRouter()
   const [ready, setReady] = useState(false)
   const [online, setOnline] = useState(false)
@@ -69,6 +71,12 @@ export function ConsoleFrame() {
     return () => clearInterval(timer)
   }, [router])
 
+  async function handleSignOut() {
+    await authClient.signOut()
+    router.replace('/sign-in')
+    router.refresh()
+  }
+
   if (!ready) {
     return (
       <main className="flex min-h-svh items-center justify-center text-sm text-muted-foreground">
@@ -90,9 +98,15 @@ export function ConsoleFrame() {
             {daemonOk ? 'Daemon' : 'Daemon starting'}
           </Badge>
         </div>
-        <Link href="/" className="text-sm text-muted-foreground hover:text-foreground">
-          Pairing
-        </Link>
+        <div className="flex items-center gap-3">
+          <span className="hidden text-sm text-muted-foreground sm:inline">{email}</span>
+          <Link href="/" className="text-sm text-muted-foreground hover:text-foreground">
+            Pairing
+          </Link>
+          <Button size="sm" variant="outline" onClick={handleSignOut}>
+            Sign out
+          </Button>
+        </div>
       </header>
       <iframe
         title="Agent Remote"
