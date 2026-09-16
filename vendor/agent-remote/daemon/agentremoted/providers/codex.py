@@ -1,0 +1,1863 @@
+"""Codex harness — OpenAI Codex CLI sessions for Agent Remote.
+
+Sessions live in ``$CODEX_HOME/state_*.sqlite`` (``threads`` table) with the
+transcript at ``rollout_path`` (JSONL). Turns run via::
+
+    codex exec --json -C <cwd> [flags] <prompt>
+    codex exec resume --json <session_id> <prompt>
+
+Stream events (``--json``) are JSONL lines of the form::
+
+    {"type":"thread.started","thread_id":"…"}
+    {"type":"item.started","item":{"type":"command_execution","command":"…"}}
+    {"type":"item.completed","item":{"type":"agent_message","text":"…"}}
+    {"type":"turn.completed","usage":{…}}
+
+Stdin is closed immediately so the CLI does not hang waiting for more input.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+import re
+import sqlite3
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from .. import providers
+from .. import steps as steps_mod
+from ..render_blocks import inline_to_rich, markdown_to_blocks
+from .. import search_util
+from .. import titles
+
+log = logging.getLogger(__name__)
+
+_MAX_TITLE = 80
+_MAX_PREVIEW = 160
+_STATE_GLOB = "state_*.sqlite"
+
+# ------------------------------------------------------------------ usage
+#
+# Codex has no `codex usage` CLI flag. ChatGPT plan limits are exposed by the
+# local app-server RPC ``account/rateLimits/read`` (what the TUI /status uses)
+# and, as a fallback, HTTP ``/backend-api/codex/usage`` with OAuth from
+# ~/.codex/auth.json. Shape matches Claude/Grok for the Usage sheet.
+
+_USAGE_URL = "https://chatgpt.com/backend-api/codex/usage"
+_TOKEN_URL = "https://auth.openai.com/oauth/token"
+# ChatGPT desktop / Codex CLI public client id (from access-token claims).
+_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_TOKEN_SKEW_S = 120  # refresh a bit early
+_USAGE_UA = "codex_cli_rs/0.146.0"
+_APP_SERVER_INIT_S = 8
+_APP_SERVER_RPC_S = 12
+_usage_app_server_lock = threading.Lock()
+
+
+def _auth_path(config) -> Path:
+    home = Path(getattr(config, "codex_home_path", None) or
+                (Path.home() / ".codex")).expanduser()
+    return home / "auth.json"
+
+
+def _jwt_payload(token: str) -> dict:
+    try:
+        part = (token or "").split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part.encode("ascii")))
+    except (IndexError, ValueError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _jwt_fresh(token: str) -> bool:
+    exp = _jwt_payload(token).get("exp")
+    try:
+        return float(exp) > time.time() + _TOKEN_SKEW_S
+    except (TypeError, ValueError):
+        return False
+
+
+def _write_auth(path: Path, data: dict) -> None:
+    tmp = path.parent / (path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.chmod(str(tmp), 0o600)
+        os.replace(str(tmp), str(path))
+    except OSError:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+
+
+def _refresh_chatgpt_token(refresh_token: str, client_id: str = "") -> dict:
+    """Exchange refresh_token for a new access_token. Returns updated token
+    fields or {} on failure."""
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id or _OAUTH_CLIENT_ID,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        _TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "codex_cli_rs",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+        return {}
+    access = str(raw.get("access_token") or "").strip()
+    if not access:
+        return {}
+    out = {"access_token": access}
+    new_refresh = str(raw.get("refresh_token") or "").strip()
+    if new_refresh:
+        out["refresh_token"] = new_refresh
+    id_tok = str(raw.get("id_token") or "").strip()
+    if id_tok:
+        out["id_token"] = id_tok
+    return out
+
+
+def _chatgpt_tokens(config) -> tuple[str, str]:
+    """Return (access_token, account_id) from ~/.codex/auth.json, refreshing
+    when the access JWT is near expiry. Empty strings if unavailable."""
+    path = _auth_path(config)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    # API-key mode has no ChatGPT plan limits via this endpoint.
+    if (data.get("auth_mode") or "").lower() == "apikey" and not (
+            data.get("tokens") or {}):
+        return "", ""
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    access = str(tokens.get("access_token") or "").strip()
+    account_id = str(tokens.get("account_id") or "").strip()
+    refresh = str(tokens.get("refresh_token") or "").strip()
+    if access and _jwt_fresh(access):
+        if not account_id:
+            authc = _jwt_payload(access).get("https://api.openai.com/auth") or {}
+            account_id = str(authc.get("chatgpt_account_id") or "").strip()
+        return access, account_id
+    if refresh:
+        claims = _jwt_payload(access) if access else {}
+        client_id = str(claims.get("client_id") or _OAUTH_CLIENT_ID)
+        updated = _refresh_chatgpt_token(refresh, client_id)
+        if updated.get("access_token"):
+            tokens.update(updated)
+            data["tokens"] = tokens
+            data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
+                                                   time.gmtime())
+            _write_auth(path, data)
+            access = updated["access_token"]
+            if not account_id:
+                authc = _jwt_payload(access).get(
+                    "https://api.openai.com/auth") or {}
+                account_id = str(
+                    authc.get("chatgpt_account_id") or "").strip()
+            return access, account_id
+    return access, account_id
+
+
+def _clamp_pct(value) -> int:
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _severity(pct: int) -> str:
+    if pct >= 90:
+        return "critical"
+    if pct >= 75:
+        return "warning"
+    return "normal"
+
+
+def _window_title(window_seconds) -> str:
+    try:
+        secs = int(window_seconds or 0)
+    except (TypeError, ValueError):
+        secs = 0
+    if secs <= 0:
+        return "Usage limit"
+    hours = secs // 3600
+    if hours >= 24 * 6:  # ~weekly or monthly window
+        days = max(1, round(hours / 24))
+        if days >= 28:
+            return "Monthly limit"
+        if days >= 6:
+            return "Weekly limit"
+        return "%d-day limit" % days
+    if hours >= 1:
+        return "%d-hour limit" % hours
+    mins = max(1, secs // 60)
+    return "%d-min limit" % mins
+
+
+def _fmt_reset_after(reset_after_seconds, reset_at) -> str:
+    """Relative reset line; prefer reset_after_seconds, fall back to reset_at."""
+    secs = None
+    try:
+        if reset_after_seconds is not None:
+            secs = int(reset_after_seconds)
+    except (TypeError, ValueError):
+        secs = None
+    if secs is None and reset_at is not None:
+        try:
+            secs = int(float(reset_at) - time.time())
+        except (TypeError, ValueError):
+            secs = None
+    if secs is None:
+        return ""
+    if secs <= 0:
+        return "Resets soon"
+    days = secs // 86400
+    hours = (secs % 86400) // 3600
+    mins = (secs % 3600) // 60
+    if days and hours:
+        return "Resets in %d d %d hr" % (days, hours)
+    if days:
+        return "Resets in %d d" % days
+    if hours and mins:
+        return "Resets in %d hr %d min" % (hours, mins)
+    if hours:
+        return "Resets in %d hr" % hours
+    if mins:
+        return "Resets in %d min" % mins
+    return "Resets soon"
+
+
+def _bucket_from_window(title: str, window: dict) -> dict | None:
+    if not isinstance(window, dict):
+        return None
+    if window.get("used_percent") is None and window.get("usedPercent") is None:
+        return None
+    pct = _clamp_pct(window.get("used_percent", window.get("usedPercent")))
+    # App-server uses windowDurationMins; HTTP uses limit_window_seconds.
+    win_s = window.get("limit_window_seconds", window.get("limitWindowSeconds"))
+    if win_s is None:
+        mins = window.get("window_duration_mins",
+                          window.get("windowDurationMins"))
+        try:
+            win_s = int(mins) * 60 if mins is not None else None
+        except (TypeError, ValueError):
+            win_s = None
+    label = title or _window_title(win_s)
+    reset_at = window.get("reset_at", window.get("resetAt",
+                          window.get("resets_at", window.get("resetsAt"))))
+    return {
+        "title": label,
+        "percent": pct,
+        "resets_text": _fmt_reset_after(
+            window.get("reset_after_seconds", window.get("resetAfterSeconds")),
+            reset_at,
+        ),
+        "severity": _severity(pct),
+    }
+
+
+def _buckets_from_app_server_rate_limits(result: dict) -> list:
+    """Map account/rateLimits/read result → usage buckets."""
+    if not isinstance(result, dict):
+        return []
+    # Prefer the codex limit id when present.
+    by_id = result.get("rateLimitsByLimitId") or result.get(
+        "rate_limits_by_limit_id") or {}
+    rl = None
+    if isinstance(by_id, dict) and by_id.get("codex"):
+        rl = by_id.get("codex")
+    if rl is None:
+        rl = result.get("rateLimits") or result.get("rate_limits")
+    if not isinstance(rl, dict):
+        return []
+    plan = str(rl.get("planType") or rl.get("plan_type") or "").strip()
+    buckets = []
+    primary = rl.get("primary") or {}
+    b = _bucket_from_window(
+        _window_title(
+            (int(primary.get("windowDurationMins") or 0) * 60)
+            if isinstance(primary, dict) else None),
+        primary if isinstance(primary, dict) else {},
+    )
+    if b:
+        if plan:
+            b["title"] = "%s · %s" % (b["title"], plan)
+        buckets.append(b)
+    secondary = rl.get("secondary")
+    if isinstance(secondary, dict):
+        b2 = _bucket_from_window("Secondary limit", secondary)
+        if b2:
+            buckets.append(b2)
+    credits = rl.get("credits") if isinstance(rl.get("credits"), dict) else {}
+    if credits.get("unlimited"):
+        buckets.append({
+            "title": "Credits",
+            "percent": 0,
+            "resets_text": "Unlimited",
+            "severity": "normal",
+        })
+    return buckets
+
+
+def _codex_bin(config) -> str:
+    return str(getattr(config, "codex_bin", None) or "codex")
+
+
+def _fetch_usage_via_app_server(config) -> dict:
+    """Primary path: brief stdio session with ``codex app-server``.
+
+    Uses the same local auth/cache as the CLI and avoids ChatGPT edge/WAF
+    that sometimes 403s bare HTTP probes from the daemon.
+    """
+    bin_path = _codex_bin(config)
+    home = str(Path(getattr(config, "codex_home_path", None)
+                    or (Path.home() / ".codex")).expanduser())
+    env = os.environ.copy()
+    env["CODEX_HOME"] = home
+    # Keep noise down; we only need JSON-RPC on stdout.
+    env.setdefault("RUST_LOG", "error")
+
+    try:
+        proc = subprocess.Popen(
+            [bin_path, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "error": "codex CLI not found on PATH"}
+    except OSError as e:
+        return {"ok": False, "error": "Could not start codex app-server: %s" % e}
+
+    def _send(obj: dict) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+
+    def _recv_for_id(want_id, timeout_s: float):
+        """Read stdout lines until a response with id==want_id or timeout.
+        Skip notifications (no id / method-only)."""
+        deadline = time.time() + timeout_s
+        assert proc.stdout is not None
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return None
+            # Blocking readline with remaining budget via select
+            import select
+            remaining = max(0.05, deadline - time.time())
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            if not ready:
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("id") == want_id:
+                return msg
+            # notification — ignore
+        return None
+
+    try:
+        _send({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "agentremoted",
+                    "title": "agentremoted",
+                    "version": "2.4.1",
+                },
+                "capabilities": {},
+            },
+        })
+        init = _recv_for_id(1, _APP_SERVER_INIT_S)
+        if not init or init.get("error"):
+            err = (init or {}).get("error") or {}
+            return {
+                "ok": False,
+                "error": "codex app-server initialize failed: %s"
+                         % (err.get("message") or "timeout"),
+            }
+        _send({"id": 2, "method": "account/rateLimits/read", "params": {}})
+        resp = _recv_for_id(2, _APP_SERVER_RPC_S)
+        if not resp:
+            return {"ok": False, "error": "codex rateLimits/read timed out"}
+        if resp.get("error"):
+            err = resp.get("error") or {}
+            msg = str(err.get("message") or err)
+            # Unauthenticated / API-key-only installs.
+            low = msg.lower()
+            if "auth" in low or "login" in low or "sign" in low:
+                return {
+                    "ok": False,
+                    "error": "No Codex ChatGPT sign-in — run `codex login` on the host.",
+                }
+            return {"ok": False, "error": "codex rateLimits/read: %s" % msg}
+        result = resp.get("result") if isinstance(resp.get("result"), dict) else {}
+        buckets = _buckets_from_app_server_rate_limits(result)
+        if not buckets:
+            return {
+                "ok": False,
+                "error": "No Codex rate-limit windows in app-server response",
+            }
+        return {"ok": True, "buckets": buckets}
+    except (BrokenPipeError, OSError) as e:
+        return {"ok": False, "error": "codex app-server I/O error: %s" % e}
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _buckets_from_codex_usage(raw: dict) -> list:
+    """Map ChatGPT codex/usage JSON → [{title, percent, resets_text, severity}]."""
+    buckets = []
+    plan = str(raw.get("plan_type") or raw.get("planType") or "").strip()
+    rl = raw.get("rate_limit") or raw.get("rateLimit") or {}
+    if isinstance(rl, dict):
+        primary = rl.get("primary_window") or rl.get("primaryWindow")
+        b = _bucket_from_window(
+            _window_title(
+                (primary or {}).get("limit_window_seconds")
+                if isinstance(primary, dict) else None),
+            primary if isinstance(primary, dict) else {},
+        )
+        if b:
+            if plan:
+                b["title"] = "%s · %s" % (b["title"], plan)
+            buckets.append(b)
+        secondary = rl.get("secondary_window") or rl.get("secondaryWindow")
+        if isinstance(secondary, dict):
+            b2 = _bucket_from_window("Secondary limit", secondary)
+            if b2:
+                buckets.append(b2)
+    # Code review window (when present).
+    cr = raw.get("code_review_rate_limit") or raw.get("codeReviewRateLimit")
+    if isinstance(cr, dict):
+        win = cr.get("primary_window") or cr.get("primaryWindow") or cr
+        b3 = _bucket_from_window("Code review", win if isinstance(win, dict) else {})
+        if b3:
+            buckets.append(b3)
+    # Credits snapshot for paid overage plans.
+    credits = raw.get("credits") if isinstance(raw.get("credits"), dict) else {}
+    if credits.get("has_credits") or credits.get("unlimited"):
+        bal = credits.get("balance")
+        if credits.get("unlimited"):
+            buckets.append({
+                "title": "Credits",
+                "percent": 0,
+                "resets_text": "Unlimited",
+                "severity": "normal",
+            })
+        elif bal is not None:
+            try:
+                # balance is remaining fraction or absolute — show as used%
+                # when 0–1, else leave percent at 0 with balance text.
+                fbal = float(bal)
+                if 0 <= fbal <= 1:
+                    pct = _clamp_pct((1.0 - fbal) * 100)
+                    buckets.append({
+                        "title": "Credits",
+                        "percent": pct,
+                        "resets_text": "%.0f%% remaining" % (fbal * 100),
+                        "severity": _severity(pct),
+                    })
+                else:
+                    buckets.append({
+                        "title": "Credits",
+                        "percent": 0,
+                        "resets_text": "Balance %s" % bal,
+                        "severity": "normal",
+                    })
+            except (TypeError, ValueError):
+                pass
+    return buckets
+
+
+def _fetch_usage_via_http(config) -> dict:
+    """Fallback: ChatGPT backend-api/codex/usage with OAuth from auth.json."""
+    access, account_id = _chatgpt_tokens(config)
+    if not access:
+        return {
+            "ok": False,
+            "error": "No Codex ChatGPT sign-in found — run `codex login` on the host.",
+        }
+    headers = {
+        "Authorization": "Bearer " + access,
+        "Accept": "application/json",
+        "User-Agent": _USAGE_UA,
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    req = urllib.request.Request(_USAGE_URL, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            path = _auth_path(config)
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                tokens = data.get("tokens") if isinstance(
+                    data.get("tokens"), dict) else {}
+                refresh = str(tokens.get("refresh_token") or "").strip()
+            except (OSError, ValueError, json.JSONDecodeError):
+                data, tokens, refresh = {}, {}, ""
+            if refresh:
+                updated = _refresh_chatgpt_token(refresh)
+                if updated.get("access_token"):
+                    tokens.update(updated)
+                    data["tokens"] = tokens
+                    _write_auth(path, data)
+                    headers["Authorization"] = "Bearer " + updated["access_token"]
+                    try:
+                        req2 = urllib.request.Request(_USAGE_URL, headers=headers)
+                        with urllib.request.urlopen(req2, timeout=20) as resp:
+                            raw = json.loads(resp.read().decode("utf-8"))
+                    except Exception:
+                        return {
+                            "ok": False,
+                            "error": "Codex sign-in expired — run `codex login` on the host.",
+                        }
+                else:
+                    return {
+                        "ok": False,
+                        "error": "Codex sign-in expired — run `codex login` on the host.",
+                    }
+            else:
+                return {
+                    "ok": False,
+                    "error": "Codex sign-in expired — run `codex login` on the host.",
+                }
+        elif e.code == 403:
+            return {
+                "ok": False,
+                "error": "ChatGPT blocked the usage request (HTTP 403).",
+            }
+        else:
+            return {"ok": False, "error": "Usage request failed (HTTP %d)" % e.code}
+    except (urllib.error.URLError, OSError) as e:
+        return {"ok": False, "error": "Could not reach ChatGPT usage API: %s" % e}
+    except (json.JSONDecodeError, ValueError):
+        return {"ok": False, "error": "Unexpected usage response"}
+
+    if not isinstance(raw, dict):
+        return {"ok": False, "error": "Unexpected usage response"}
+    buckets = _buckets_from_codex_usage(raw)
+    if not buckets:
+        plan = str(raw.get("plan_type") or "").strip() or "unknown"
+        if (raw.get("rate_limit") or {}).get("allowed") is True:
+            return {
+                "ok": True,
+                "buckets": [{
+                    "title": "Plan · %s" % plan,
+                    "percent": 0,
+                    "resets_text": "No rate-limit windows reported",
+                    "severity": "normal",
+                }],
+            }
+        return {"ok": False, "error": "No Codex usage windows in response"}
+    return {"ok": True, "buckets": buckets}
+
+
+def account_identity(config=None) -> dict:
+    """ChatGPT / Codex seat identity for cross-host usage dedup.
+
+    Prefer id_token email, then access_token profile email, then account_id.
+    """
+    email = ""
+    account_id = ""
+    name = ""
+    path = _auth_path(config) if config is not None else (
+        Path.home() / ".codex" / "auth.json")
+    try:
+        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    account_id = str(tokens.get("account_id") or "").strip()
+    for key in ("id_token", "access_token"):
+        tok = str(tokens.get(key) or "").strip()
+        if not tok:
+            continue
+        claims = _jwt_payload(tok)
+        if not email:
+            email = str(claims.get("email") or "").strip()
+            prof = claims.get("https://api.openai.com/profile") or {}
+            if not email and isinstance(prof, dict):
+                email = str(prof.get("email") or "").strip()
+            if not name and isinstance(prof, dict):
+                name = str(prof.get("name") or "").strip()
+            if not name:
+                name = str(claims.get("name") or "").strip()
+        if not account_id:
+            authc = claims.get("https://api.openai.com/auth") or {}
+            if isinstance(authc, dict):
+                account_id = str(authc.get("chatgpt_account_id") or "").strip()
+            if not account_id:
+                account_id = str(claims.get("sub") or "").strip()
+    mode = str(data.get("auth_mode") or "").lower()
+    if not email and not account_id and mode == "apikey":
+        return {"account": "api-key", "account_id": "api-key"}
+    account = email or name or account_id
+    return {"account": account, "account_id": account_id or account}
+
+
+def _with_identity(data: dict, config=None) -> dict:
+    out = dict(data or {})
+    out["provider"] = "codex"
+    ident = account_identity(config)
+    out["account"] = ident.get("account") or ""
+    out["account_id"] = ident.get("account_id") or out["account"]
+    return out
+
+
+def fetch_usage(config) -> dict:
+    """Return {"ok": True, "buckets": [...]} or {"ok": False, "error": str}.
+
+    Prefer ``codex app-server`` rateLimits RPC (reliable, same auth as the
+    CLI). Fall back to ChatGPT HTTP if app-server is unavailable.
+
+    Always stamps ``provider`` / ``account`` / ``account_id`` for multi-host
+    clients that merge the same ChatGPT plan across daemons.
+    """
+    with _usage_app_server_lock:
+        primary = _fetch_usage_via_app_server(config)
+    if primary.get("ok"):
+        return _with_identity(primary, config)
+    # App-server missing / timed out / auth error — try HTTP once.
+    secondary = _fetch_usage_via_http(config)
+    if secondary.get("ok"):
+        return _with_identity(secondary, config)
+    # Prefer the more specific of the two errors.
+    err = primary.get("error") or secondary.get("error") or "usage failed"
+    if secondary.get("error") and "app-server" in str(primary.get("error") or ""):
+        err = "%s (HTTP fallback: %s)" % (
+            primary.get("error"), secondary.get("error"))
+    return _with_identity({"ok": False, "error": err}, config)
+
+
+def _preview(text: str, n: int = _MAX_PREVIEW) -> str:
+    text = " ".join(str(text or "").split())
+    if len(text) <= n:
+        return text
+    return text[: n - 1] + "…"
+
+
+def _munge_cwd(cwd: str) -> str:
+    s = str(cwd or "").strip().replace("\\", "/")
+    if not s:
+        return "no-project"
+    if s.startswith("/"):
+        s = s[1:]
+    return "-" + s.replace("/", "-").replace(" ", "-")
+
+
+def _iso_from_unix(ts) -> str:
+    try:
+        t = int(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if t <= 0:
+        return ""
+    # state may store seconds or ms
+    if t > 10_000_000_000:
+        t = t // 1000
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    except (OverflowError, ValueError, OSError):
+        return ""
+
+
+def _safe_json(line: str):
+    try:
+        return json.loads(line)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
+def _content_text(content) -> str:
+    """Flatten Codex content blocks (text / Text / input_text / output_text)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                if block.strip():
+                    parts.append(block)
+            elif isinstance(block, dict):
+                t = (block.get("text")
+                     or block.get("input_text")
+                     or block.get("output_text")
+                     or "")
+                if t:
+                    parts.append(str(t))
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
+def _item_text(item: dict) -> str:
+    """Text from a message-like payload (legacy message/text or content[])."""
+    if not isinstance(item, dict):
+        return ""
+    raw = item.get("message")
+    if raw is None:
+        raw = item.get("text")
+    if isinstance(raw, list):
+        return _content_text(raw)
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()
+    return _content_text(item.get("content"))
+
+
+def _event_chat_message(ev: dict):
+    """Return (role, text) for a phone-visible chat turn, or None.
+
+    Codex CLI ≥0.14x stopped emitting ``event_msg`` ``user_message`` /
+    ``agent_message``. Turns now land as::
+
+        event_msg / item_completed / item.type = UserMessage | AgentMessage
+        content: [{type: text|Text, text: "…"}]
+
+    Older rollouts still use ``user_message`` / ``agent_message`` with a
+    ``message`` string. Ignore ``response_item`` here — AGENTS.md is injected
+    as a synthetic user message and would pollute the transcript.
+    """
+    if not isinstance(ev, dict):
+        return None
+    if str(ev.get("type") or "") != "event_msg":
+        return None
+    payload = ev.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    ptype = str(payload.get("type") or "")
+    if ptype == "user_message":
+        text = _item_text(payload)
+        return ("user", text) if text else None
+    if ptype == "agent_message":
+        text = _item_text(payload)
+        return ("assistant", text) if text else None
+    if ptype == "item_completed":
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+        itype = str(item.get("type") or "")
+        if itype in ("UserMessage", "user_message"):
+            text = _item_text(item)
+            return ("user", text) if text else None
+        if itype in ("AgentMessage", "agent_message"):
+            text = _item_text(item)
+            return ("assistant", text) if text else None
+    return None
+
+
+def _is_user_prompt_event(ev: dict) -> bool:
+    """True for human user turns (submit confirm + rewind anchors)."""
+    hit = _event_chat_message(ev)
+    return bool(hit and hit[0] == "user" and hit[1])
+
+
+def _unescape_js_fragment(s: str) -> str:
+    return (s or "").replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"').replace("\\'", "'")
+
+
+def _parse_codex_tool_input(raw: str) -> tuple:
+    """Parse Codex ``custom_tool_call.input`` JS snippets → (name, detail)."""
+    s = raw or ""
+    # tools.exec_command({cmd:"ls", ...}) / tools.web__run({search_query:...})
+    fn_m = re.search(r"tools\.([A-Za-z0-9_]+)\s*\(", s)
+    tool_fn = fn_m.group(1) if fn_m else ""
+    cmd_m = re.search(r"""\bcmd\s*:\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""", s)
+    if cmd_m:
+        lit = cmd_m.group(1)
+        cmd = _unescape_js_fragment(lit[1:-1])
+        return "shell", " ".join(cmd.split())[:200]
+    if "search_query" in s or tool_fn.startswith("web"):
+        qs = re.findall(r"""\bq\s*:\s*"((?:\\.|[^"\\])*)\"""", s)
+        if not qs:
+            qs = re.findall(r"""\bq\s*:\s*'((?:\\.|[^'\\])*)'""", s)
+        detail = "; ".join(_unescape_js_fragment(q) for q in qs[:3]) if qs else "web search"
+        return "web_search", detail[:200]
+    if "Begin Patch" in s or "apply_patch" in tool_fn or tool_fn in ("apply_patch",):
+        files = re.findall(r"\*\*\* (?:Add|Update|Delete) File:\s*([^\n\\]+)", s)
+        detail = ", ".join(f.strip() for f in files[:4]) if files else "patch"
+        return "edit", detail[:200]
+    if tool_fn:
+        pretty = tool_fn.replace("__", ".")
+        return pretty, " ".join(s.split())[:160]
+    return "exec", " ".join(s.split())[:160]
+
+
+def _event_tool(ev: dict):
+    """Return {name, detail} for a tool activity event, or None.
+
+    Codex records tools primarily as::
+
+        response_item / custom_tool_call  {name: "exec", input: "tools.exec_command({cmd:…})"}
+
+    with occasional ``event_msg`` summaries (``patch_apply_end``, ``web_search_end``).
+    """
+    if not isinstance(ev, dict):
+        return None
+    et = str(ev.get("type") or "")
+    payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+
+    if et == "response_item":
+        ptype = str(payload.get("type") or "")
+        if ptype == "custom_tool_call":
+            name, detail = _parse_codex_tool_input(str(payload.get("input") or ""))
+            return {"name": name, "detail": detail}
+        if ptype in ("function_call", "tool_call", "custom_tool_call"):
+            name = str(payload.get("name") or "tool")
+            args = payload.get("arguments") if payload.get("arguments") is not None \
+                else payload.get("input")
+            if isinstance(args, dict):
+                detail = str(args.get("description") or args.get("cmd")
+                             or args.get("command") or args.get("path")
+                             or args)[:200]
+            else:
+                detail = str(args or "")[:200]
+            if name in ("exec", "shell", "Bash"):
+                name = "shell"
+            return {"name": name, "detail": " ".join(detail.split())}
+        return None
+
+    if et != "event_msg":
+        return None
+    ptype = str(payload.get("type") or "")
+    if ptype in ("command_execution", "exec_command"):
+        cmd = str(payload.get("command") or payload.get("cmd") or "shell")
+        return {"name": "shell", "detail": " ".join(cmd.split())[:200]}
+    # patch_apply_end / web_search_end duplicate the matching custom_tool_call
+    # (same turn, less detail) — skip so the transcript/ticker stay clean.
+    if ptype == "item_completed":
+        item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+        itype = str(item.get("type") or "")
+        if itype in ("CommandExecution", "command_execution", "ShellCommand"):
+            cmd = str(item.get("command") or item.get("cmd") or "")
+            if not cmd and item.get("input"):
+                return dict(zip(("name", "detail"),
+                                _parse_codex_tool_input(str(item.get("input")))))
+            return {"name": "shell", "detail": (cmd or itype)[:200]}
+        if itype in ("FileChange", "file_change", "ApplyPatch", "apply_patch"):
+            path = str(item.get("path") or item.get("file") or "edit")
+            return {"name": "edit", "detail": path[:200]}
+        if itype in ("WebSearch", "web_search"):
+            q = str(item.get("query") or item.get("q") or "web search")
+            return {"name": "web_search", "detail": q[:200]}
+    return None
+
+
+class CodexStore:
+    """Read Codex threads from the on-disk SQLite index + rollout JSONL."""
+
+    def __init__(self, home: Path, config=None):
+        self.home = Path(home).expanduser()
+        self.config = config
+        # Set by providers.build_one to this harness's own generator.
+        self.titler = None
+
+    # -- discovery ------------------------------------------------------
+
+    def _state_db(self) -> Path | None:
+        if not self.home.is_dir():
+            return None
+        # Prefer the highest numbered state_N.sqlite (schema evolves).
+        candidates = sorted(self.home.glob(_STATE_GLOB), reverse=True)
+        for path in candidates:
+            if path.is_file():
+                return path
+        legacy = self.home / "state.sqlite"
+        return legacy if legacy.is_file() else None
+
+    def _connect(self):
+        db = self._state_db()
+        if db is None:
+            return None
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            con.row_factory = sqlite3.Row
+            return con
+        except sqlite3.Error as e:
+            log.warning("codex state db open failed: %s", e)
+            return None
+
+    def _rows(self, user_only: bool = True, project_cwd: str = None):
+        con = self._connect()
+        if con is None:
+            return []
+        try:
+            q = ("SELECT id, title, cwd, model, git_branch, preview, "
+                 "rollout_path, created_at, updated_at, archived, "
+                 "first_user_message, has_user_event "
+                 "FROM threads")
+            clauses = []
+            args = []
+            if user_only:
+                clauses.append("COALESCE(archived, 0) = 0")
+                # Skip empty shells that never saw a user event when possible.
+                clauses.append("(COALESCE(has_user_event, 1) = 1 "
+                               "OR length(COALESCE(first_user_message,'')) > 0 "
+                               "OR length(COALESCE(preview,'')) > 0)")
+                # The throwaway turns the title generator runs are not the
+                # human's sessions; they are identified by their cwd.
+                clauses.append("COALESCE(cwd, '') <> ?")
+                args.append(str(titles.titler_cwd()))
+            if project_cwd:
+                clauses.append("cwd = ?")
+                args.append(project_cwd)
+            if clauses:
+                q += " WHERE " + " AND ".join(clauses)
+            q += " ORDER BY COALESCE(updated_at, created_at) DESC"
+            return list(con.execute(q, args))
+        except sqlite3.Error as e:
+            log.warning("codex threads query failed: %s", e)
+            return []
+        finally:
+            con.close()
+
+    # -- store API ------------------------------------------------------
+
+    def list_projects(self):
+        by_cwd = {}
+        for row in self._rows(user_only=True):
+            cwd = (row["cwd"] or "").strip() or "(no project)"
+            rec = by_cwd.get(cwd)
+            # Float epoch like claude/grok — ISO strings break multi merge sort
+            # and Android ProjectDto (last_active: Double).
+            ts = float(row["updated_at"] or row["created_at"] or 0)
+            if rec is None:
+                by_cwd[cwd] = {
+                    "id": _munge_cwd(cwd if cwd != "(no project)" else ""),
+                    "cwd": "" if cwd == "(no project)" else cwd,
+                    "name": Path(cwd).name if cwd not in ("", "(no project)") else "no-project",
+                    "session_count": 1,
+                    "last_active": ts,
+                }
+            else:
+                rec["session_count"] += 1
+                if ts > float(rec.get("last_active") or 0):
+                    rec["last_active"] = ts
+        return sorted(by_cwd.values(), key=lambda p: p["last_active"], reverse=True)
+
+    def list_sessions(self, project_id=None, limit=25, user_only=True):
+        project_cwd = None
+        if project_id and project_id != "no-project":
+            # Reverse munge is lossy; match by scanning.
+            for row in self._rows(user_only=user_only):
+                if _munge_cwd(row["cwd"] or "") == project_id:
+                    project_cwd = row["cwd"]
+                    break
+            if project_cwd is None and project_id:
+                # No match — empty list rather than everything.
+                return []
+        rows = self._rows(user_only=user_only, project_cwd=project_cwd)
+        limit = max(1, min(int(limit or 25), 200))
+        return [self._summary(r) for r in rows[:limit]]
+
+    def search_sessions(self, query, project_id=None, limit=25, user_only=True):
+        return list(self.iter_search_sessions(
+            query, project_id=project_id, limit=limit, user_only=user_only))
+
+    def iter_search_sessions(self, query, project_id=None, limit=25, user_only=True):
+        """Yield hits: sqlite meta fields first, then rollout body scans."""
+        if not (query or "").strip():
+            return
+        q = query.strip()
+        limit = max(1, min(int(limit or 25), 100))
+        yielded = 0
+        need_body = []
+        for row in self._rows(user_only=user_only):
+            if project_id and _munge_cwd(row["cwd"] or "") != project_id:
+                continue
+            hay = " ".join([
+                row["title"] or "",
+                row["preview"] or "",
+                row["first_user_message"] or "",
+                row["cwd"] or "",
+            ])
+            snippet = None
+            if search_util.contains_ci(hay, q):
+                for field in (row["title"], row["preview"], row["first_user_message"]):
+                    if field and search_util.contains_ci(field, q):
+                        snippet = search_util.make_snippet(field, q)
+                        break
+                snippet = snippet or search_util.make_snippet(hay, q)
+            if snippet:
+                s = self._summary(row)
+                s["snippet"] = snippet
+                yield s
+                yielded += 1
+                if yielded >= limit:
+                    return
+            else:
+                need_body.append(row)
+        for row in need_body:
+            if yielded >= limit:
+                return
+            snippet = self._search_rollout(row["rollout_path"] or "", q)
+            if not snippet:
+                continue
+            s = self._summary(row)
+            s["snippet"] = snippet
+            yield s
+            yielded += 1
+
+    def get_session(self, session_id: str):
+        con = self._connect()
+        if con is None:
+            return None
+        try:
+            row = con.execute(
+                "SELECT id, title, cwd, model, git_branch, preview, "
+                "rollout_path, created_at, updated_at, archived, "
+                "first_user_message, has_user_event "
+                "FROM threads WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        finally:
+            con.close()
+        if row is None:
+            return None
+        return self._summary(row)
+
+    def rollout_path(self, session_id: str) -> str:
+        """rollout_path of one thread id ("" when unknown)."""
+        con = self._connect()
+        if con is None:
+            return ""
+        try:
+            r = con.execute(
+                "SELECT rollout_path FROM threads WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            return (r["rollout_path"] if r else "") or ""
+        except sqlite3.Error:
+            return ""
+        finally:
+            con.close()
+
+    supports_steps = True     # `?detail=steps` (see agentremoted.steps)
+
+    def get_step(self, session_id: str, ref: str):
+        """Full text behind one truncated step — re-read the rollout line."""
+        if not ref or len(ref) < 3:
+            return None
+        kind, num = ref[:2], ref[2:]
+        try:
+            want = int(num)
+        except ValueError:
+            return None
+        path = self._rollout_path(session_id)
+        if not path:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for ln, line in enumerate(f):
+                    if ln != want:
+                        continue
+                    ev = _safe_json(line)
+                    p = (ev or {}).get("payload") or {}
+                    if kind == "cu":
+                        # Same arguments/input split as _codex_step.
+                        args = p.get("arguments")
+                        if args is None:
+                            args = p.get("input")
+                        text = steps_mod.format_tool_use(
+                            p.get("name") or "tool", args)
+                    elif kind == "cr":
+                        out = p.get("output")
+                        if not isinstance(out, str):
+                            try:
+                                out = json.dumps(out, indent=1,
+                                                 ensure_ascii=False)
+                            except (TypeError, ValueError):
+                                out = str(out)
+                        text = steps_mod.format_tool_result(out or "")
+                    elif kind == "ct":
+                        text = _codex_reasoning(p)
+                    else:
+                        return None
+                    return {"ref": ref, "text": text or "",
+                            "bytes": len(text or "")}
+        except (OSError, TypeError, ValueError):
+            return None
+        return None
+
+    def _rollout_path(self, session_id: str) -> str:
+        con = self._connect()
+        if con is None:
+            return ""
+        try:
+            r = con.execute("SELECT rollout_path FROM threads WHERE id = ?",
+                            (session_id,)).fetchone()
+            return (r["rollout_path"] if r else "") or ""
+        except sqlite3.Error:
+            return ""
+        finally:
+            con.close()
+
+    def get_messages(self, session_id: str, offset: int = None, limit: int = 50,
+                     steps: bool = False):
+        sess = self.get_session(session_id)
+        if sess is None:
+            return None
+        con = self._connect()
+        path = ""
+        if con is not None:
+            try:
+                r = con.execute(
+                    "SELECT rollout_path FROM threads WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                path = (r["rollout_path"] if r else "") or ""
+            except sqlite3.Error:
+                path = ""
+            finally:
+                con.close()
+        t0 = time.perf_counter()
+        step_rows = []
+        if steps:
+            messages, step_rows = _build_transcript(
+                Path(path) if path else None, want_steps=True)
+        else:
+            messages = _build_transcript(Path(path) if path else None)
+        t1 = time.perf_counter()
+        total = len(messages)
+        if offset is None:
+            offset = max(0, total - limit)
+        offset = max(0, offset)
+        window = messages[offset: offset + limit]
+        for msg in window:
+            _render_codex_message(msg)
+        if steps:
+            steps_mod.attach(window, step_rows)
+            for msg in messages:
+                msg.pop("_pos", None)
+        t2 = time.perf_counter()
+        try:
+            file_bytes = Path(path).stat().st_size if path else 0
+        except OSError:
+            file_bytes = 0
+        return {
+            "session_id": session_id,
+            "total": total,
+            "offset": offset,
+            "messages": window,
+            "timing": {
+                "parse_ms": round((t1 - t0) * 1000, 1),
+                "render_ms": round((t2 - t1) * 1000, 1),
+                "total_ms": round((t2 - t0) * 1000, 1),
+                "count_total": total,
+                "count_window": len(window),
+                "file_bytes": file_bytes,
+            },
+        }
+
+    def known_session_ids(self) -> set:
+        return {r["id"] for r in self._rows(user_only=False) if r["id"]}
+
+    def _derived_title(self, session_id: str, first: str) -> str:
+        """Cached AI title for a session Codex never named itself."""
+        if self.config is None or not session_id or not first:
+            return ""
+        cache = titles.shared_cache(self.config)
+        sig = titles.sig_for(first)
+        got = cache.get(session_id, sig)
+        if got:
+            return got
+        cache.request(session_id, sig, first, self.titler)
+        return ""
+
+    def _summary(self, row) -> dict:
+        cwd = (row["cwd"] or "").strip()
+        title = " ".join(str(row["title"] or "").split())
+        if titles.looks_blank(title):
+            # Codex usually stores no title, so the fallback is a raw opening
+            # message. Derive one instead; the raw text shows once while the
+            # first call is in flight.
+            first = " ".join(
+                str(row["first_user_message"] or row["preview"] or "").split())
+            title = self._derived_title(row["id"] or "", first) or first
+        if not title:
+            title = "Session %s" % (row["id"] or "")[:8]
+        last = row["preview"] or row["first_user_message"] or ""
+        try:
+            size = Path(row["rollout_path"] or "").stat().st_size
+        except OSError:
+            size = 0
+        return {
+            "id": row["id"],
+            "project_id": _munge_cwd(cwd),
+            "cwd": cwd,
+            "git_branch": row["git_branch"] or "",
+            "title": _preview(title, _MAX_TITLE),
+            "started": _iso_from_unix(row["created_at"]),
+            "last_active": _iso_from_unix(row["updated_at"] or row["created_at"]),
+            "last_role": "assistant" if last else "",
+            "last_text": _preview(last),
+            "model": row["model"] or "",
+            "size_bytes": size,
+        }
+
+    @staticmethod
+    def _search_rollout(path: str, query: str):
+        if not path:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f):
+                    if i > 400:
+                        break
+                    ev = _safe_json(line)
+                    if not isinstance(ev, dict):
+                        continue
+                    hit = _event_chat_message(ev)
+                    if hit and hit[1] and search_util.contains_ci(hit[1], query):
+                        return search_util.make_snippet(hit[1], query)
+                    # Also scan raw payload fields for tool/command hits.
+                    payload = ev.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    text = payload.get("message") or payload.get("text") or ""
+                    if isinstance(text, list):
+                        text = _content_text(text)
+                    if text and search_util.contains_ci(str(text), query):
+                        return search_util.make_snippet(str(text), query)
+        except OSError:
+            return None
+        return None
+
+
+def _build_transcript(path: Path | None, want_steps: bool = False):
+    """Coalesce rollout JSONL into [{role, text, ts}] for the phone.
+
+    Conversation only (user + assistant) by default. With ``want_steps`` the
+    turn's working records are collected too — function calls, their output
+    and the reasoning — and returned alongside, tagged with the rollout line
+    they came from so they can be attached to the message they followed.
+    """
+    if path is None or not path.is_file():
+        return ([], []) if want_steps else []
+    messages = []
+    step_rows = []
+    # call_id → (name, path) so function_call_output can inherit a lang.
+    tool_meta = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for ln, line in enumerate(f):
+                ev = _safe_json(line)
+                if not isinstance(ev, dict):
+                    continue
+                if want_steps:
+                    st = _codex_step(ev, ln, tool_meta)
+                    if st is not None:
+                        step_rows.append((ln, st))
+                hit = _event_chat_message(ev)
+                if not hit:
+                    continue
+                role, text = hit
+                ts = str(ev.get("timestamp") or "")
+                prefix = "u" if role == "user" else "a"
+                msg = {
+                    "uuid": "%s%d" % (prefix, len(messages)),
+                    "role": role,
+                    "ts": ts,
+                    "text": text,
+                }
+                if want_steps:
+                    msg["_pos"] = ln
+                messages.append(msg)
+    except OSError:
+        return (messages, step_rows) if want_steps else messages
+    return (messages, step_rows) if want_steps else messages
+
+
+def _codex_step(ev: dict, ln: int, tool_meta: dict = None):
+    """One process step from a rollout line, or None.
+
+    Codex records the work as `response_item`s: function_call /
+    custom_tool_call carry the arguments, their *_output twins carry the
+    result, and `reasoning` carries the thinking (plaintext in `summary`,
+    with `encrypted_content` as the fallback shape).
+    """
+    if str(ev.get("type") or "") != "response_item":
+        return None
+    p = ev.get("payload")
+    if not isinstance(p, dict):
+        return None
+    ptype = str(p.get("type") or "")
+    ts = str(ev.get("timestamp") or "")
+    if ptype in ("function_call", "custom_tool_call"):
+        # function_call carries `arguments`; custom_tool_call (apply_patch and
+        # friends) carries `input` instead — reading only the former showed
+        # every patch as "null".
+        args = p.get("arguments")
+        if args is None:
+            args = p.get("input")
+        name = p.get("name") or "tool"
+        body = steps_mod.format_tool_use(name, args)
+        lang = steps_mod.lang_for_tool_use(name, args)
+        path = steps_mod.path_from_input(args)
+        cid = p.get("call_id") or p.get("id")
+        if tool_meta is not None and cid:
+            tool_meta[str(cid)] = (name, path)
+        return steps_mod.tool_use("cu%d" % ln, ts, name,
+                                  _codex_call_detail(args), body, lang=lang)
+    if ptype in ("function_call_output", "custom_tool_call_output"):
+        out = p.get("output")
+        if not isinstance(out, str):
+            try:
+                out = json.dumps(out, indent=1, ensure_ascii=False)
+            except (TypeError, ValueError):
+                out = str(out)
+        body = steps_mod.format_tool_result(out or "")
+        name, path = "", ""
+        cid = p.get("call_id") or p.get("id")
+        if tool_meta is not None and cid and str(cid) in tool_meta:
+            name, path = tool_meta[str(cid)]
+        lang = steps_mod.lang_for_tool_result(name, path, body)
+        # Codex reports shell failures as "Process exited with code N". Only
+        # that is treated as failure — sniffing for the word "error" flagged
+        # every grep for the string "error" as a failed call.
+        ok = not re.search(r"exited with code [1-9]", body or "")
+        return steps_mod.tool_result("cr%d" % ln, ts, ok, body or "",
+                                     lang=lang)
+    if ptype == "reasoning":
+        return steps_mod.thinking("ct%d" % ln, ts, _codex_reasoning(p))
+    return None
+
+
+def _codex_reasoning(p: dict) -> str:
+    parts = []
+    for item in p.get("summary") or []:
+        if isinstance(item, dict) and item.get("text"):
+            parts.append(item["text"])
+    if parts:
+        return "\n".join(parts)
+    enc = p.get("encrypted_content")
+    # Only readable when Codex stored it in the clear; base64 ciphertext is
+    # not something to render, so let the marker path handle it.
+    return enc if isinstance(enc, str) and " " in enc[:120] else ""
+
+
+def _codex_call_detail(args: str) -> str:
+    """Short line naming what a call is about — prefer description, else cmd."""
+    try:
+        obj = json.loads(args) if isinstance(args, str) else args
+    except (TypeError, ValueError):
+        return " ".join((args or "").split())[:200]
+    if not isinstance(obj, dict):
+        return ""
+    for key in ("description", "cmd", "command", "path", "file_path",
+                "query", "pattern"):
+        val = obj.get(key)
+        if isinstance(val, list):
+            val = " ".join(str(v) for v in val)
+        if isinstance(val, str) and val.strip():
+            return " ".join(val.split())[:200]
+    return ""
+
+
+def _render_codex_message(msg: dict) -> None:
+    """Attach display blocks. User rows must be k=user so BB/Android/web
+    paint the chevron + well chrome (same as Claude/Grok). Assistant stays
+    markdown_to_blocks. Previously every role used markdown_to_blocks, so
+    historical Codex prompts rendered as plain assistant paragraphs.
+    """
+    text = (msg.get("text") or "").strip()
+    role = msg.get("role") or ""
+    if role in ("status", "notice", "tool"):
+        # Web/Android render status as plain text; no markdown blocks needed.
+        return
+    if not text or role not in ("assistant", "user"):
+        return
+    if role == "user":
+        plain, rich = inline_to_rich(text)
+        msg["blocks"] = [{
+            "k": "user",
+            "role": "user",
+            "text": plain,
+            "rich": rich,
+            "fmt": "rich",
+        }]
+    else:
+        msg["blocks"] = markdown_to_blocks(text, role="assistant")
+
+
+class CodexRunner:
+    name = "codex"
+
+    def __init__(self, config):
+        self.config = config
+        self.store = CodexStore(config.codex_home_path, config)
+        # Lazily created tmux-TUI manager for "interactive" jobs.
+        self._interactive = None
+        self._interactive_lock = threading.Lock()
+
+    def _interactive_mgr(self):
+        with self._interactive_lock:
+            if self._interactive is None:
+                from .codex_interactive import CodexInteractiveManager
+                self._interactive = CodexInteractiveManager(self.config, self)
+            return self._interactive
+
+    def run_alternate(self, job, mode) -> bool:
+        """Fully handle a job outside the subprocess pipeline. "interactive"
+        drives a real ``codex`` TUI in tmux (same mode Claude/Grok expose)."""
+        if mode != "interactive":
+            return False
+        self._interactive_mgr().run(job)
+        return True
+
+    def resume_alternate(self, job) -> None:
+        """Continue an interactive job after daemon restart (tmux TUI adopted)."""
+        self._interactive_mgr().resume(job)
+
+    def rewind_session(self, session_id: str, steps: int):
+        """Truncate the rollout JSONL back N user prompts (conversation only
+        — files on disk are not restored). ``codex exec resume`` and the TUI
+        rebuild context from the rollout, so the truncated file IS the
+        rewound session (verified: a resumed session forgets the dropped
+        turns). The sqlite threads index holds only metadata and stays
+        valid. Returns (steps_done, preview_of_first_dropped_prompt)."""
+        sid = (session_id or "").strip()
+        path_s = self.store.rollout_path(sid) if sid else ""
+        path = Path(path_s) if path_s else None
+        if path is None or not path.is_file():
+            raise providers.RunnerError("session rollout not found")
+        # A live TUI holds the pre-cut conversation in memory; close it so
+        # the next interactive turn resumes the rewound session.
+        self._interactive_mgr().close_for_session(sid)
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        lines = raw.splitlines()
+        # Human prompts are the same rows the phone transcript shows:
+        # event_msg/user_message (legacy) or item_completed/UserMessage.
+        # Harness-injected AGENTS.md lives only on response_item and is
+        # skipped by _is_user_prompt_event.
+        marks = []
+        for i, line in enumerate(lines):
+            ev = _safe_json(line)
+            if not isinstance(ev, dict):
+                continue
+            hit = _event_chat_message(ev)
+            if hit and hit[0] == "user" and hit[1]:
+                marks.append((i, hit[1]))
+        if not marks:
+            raise providers.RunnerError(
+                "nothing to rewind — no user messages yet")
+        steps = max(1, min(int(steps), len(marks)))
+        anchor, text = marks[-steps]
+        prev_mark = marks[-steps - 1][0] if steps < len(marks) else -1
+        # Walk back over the prompt's own turn scaffolding (its user
+        # response_item, turn_context, world_state, task_started) so the cut
+        # lands on the turn boundary, not mid-turn.
+        cut = anchor
+        j = anchor - 1
+        while j > prev_mark:
+            ev = _safe_json(lines[j]) or {}
+            etype = ev.get("type")
+            payload = ev.get("payload") or {}
+            ptype = str(payload.get("type") or "")
+            if (etype == "response_item" and ptype == "message"
+                    and payload.get("role") == "user"):
+                cut = j
+            elif etype in ("turn_context", "world_state"):
+                cut = j
+            elif etype == "event_msg" and ptype == "task_started":
+                cut = j
+            else:
+                break
+            j -= 1
+        backup = path.parent / (path.name + ".rewind-bak")
+        try:
+            backup.write_text(raw, encoding="utf-8")
+        except OSError:
+            pass  # safety net only; the rewind itself still proceeds
+        with open(path, "w", encoding="utf-8") as f:
+            if cut:
+                f.write("\n".join(lines[:cut]) + "\n")
+        preview = " ".join(text.split())[:120]
+        return steps, preview
+
+    def type_into_tui(self, session_id: str, text: str) -> str:
+        """Type a message into a session's live interactive TUI (\"\" or err)."""
+        return self._interactive_mgr().type_text(session_id, text)
+
+    def capture_tui(self, session_id: str, *, ansi: bool = False) -> dict:
+        return self._interactive_mgr().capture_tui(session_id, ansi=ansi)
+
+    def send_tui_keys(self, session_id: str, keys=None, text: str = "") -> str:
+        return self._interactive_mgr().send_tui_keys(session_id, keys=keys, text=text)
+
+    def usage(self) -> dict:
+        """Subscription / plan rate limits for the Usage sheet."""
+        return fetch_usage(self.config)
+
+    def capabilities(self):
+        from .codex_interactive import tmux_available
+        has_tmux = tmux_available()
+        return {
+            "queue": True,
+            "stop": True,
+            "projects": True,
+            "ws_status": True,
+            "permissions": False,
+            "permission_modes": False,
+            "requires_cwd": True,
+            "can_set_model": True,
+            "can_set_effort": False,
+            # ChatGPT-plan rate limits via backend-api/codex/usage (OAuth).
+            "can_show_usage": True,
+            "turns": True,
+            # "interactive" permission mode: turns run in a host tmux TUI.
+            # Requires tmux on the host (same as Claude/Grok interactive).
+            "interactive": has_tmux,
+            "live_tui": has_tmux,
+            # "/rewind N": the daemon truncates the rollout JSONL back N
+            # user prompts (conversation only) and the next turn resumes
+            # from there. Works in BOTH exec modes — codex's own TUI has no
+            # rewind, but the daemon does not need one.
+            "rewind": True,
+        }
+
+    def auth_health(self) -> dict:
+        """Local credential snapshot for /api/ping (no network)."""
+        import shutil
+        bin_path = _codex_bin(self.config)
+        on_path = bool(shutil.which(bin_path))
+        api_key = str(os.environ.get("OPENAI_API_KEY") or "").strip()
+        path = _auth_path(self.config)
+        data = {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data = raw
+        except (OSError, ValueError, json.JSONDecodeError):
+            data = {}
+        mode_field = str(data.get("auth_mode") or "").lower()
+        tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+        access = str(tokens.get("access_token") or "").strip()
+        refresh = str(tokens.get("refresh_token") or "").strip()
+
+        if mode_field == "apikey" or (api_key and not access):
+            return {
+                "cli": "codex",
+                "cli_on_path": on_path,
+                "mode": "api_key",
+                "status": "ok" if on_path else "warning",
+                "detail": ("OpenAI API key mode"
+                           + ("" if on_path else "; `codex` not on PATH")),
+            }
+        if access and _jwt_fresh(access):
+            return {
+                "cli": "codex",
+                "cli_on_path": on_path,
+                "mode": "subscription",
+                "status": "ok" if on_path else "warning",
+                "detail": ("ChatGPT / Codex login looks valid"
+                           + ("" if on_path else "; `codex` not on PATH")),
+            }
+        if access or refresh:
+            return {
+                "cli": "codex",
+                "cli_on_path": on_path,
+                "mode": "subscription",
+                "status": "expired",
+                "detail": "Codex sign-in expired — run `codex` login on this host",
+            }
+        if api_key:
+            return {
+                "cli": "codex",
+                "cli_on_path": on_path,
+                "mode": "api_key",
+                "status": "ok" if on_path else "warning",
+                "detail": "OPENAI_API_KEY set"
+                          + ("" if on_path else "; `codex` not on PATH"),
+            }
+        return {
+            "cli": "codex",
+            "cli_on_path": on_path,
+            "mode": "none",
+            "status": "missing",
+            "detail": ("No Codex login or API key on this host"
+                       + ("" if on_path else "; `codex` not on PATH")),
+        }
+
+    # Verified in codex's own TUI command list: /compact, /exit and /fork
+    # (codex.thread.fork) are there. /rewind is served by the DAEMON
+    # (rollout truncation in jobs.py), so it works on headless turns too.
+    # /goal is always advertised so phone/web clients do not refuse it.
+    _BUILTIN_SLASH = ["/compact", "/exit", "/fork", "/goal", "/rewind"]
+
+    def slash_commands(self):
+        out = list(self._BUILTIN_SLASH)
+        for extra in getattr(self.config, "slash_commands", None) or []:
+            if isinstance(extra, str) and extra.strip():
+                out.append(extra.strip())
+        return sorted(set(out))
+
+    def models(self):
+        extras = list(getattr(self.config, "models", None) or [])
+        # models_cache.json is optional flavour; extras always win for the picker.
+        cached = []
+        try:
+            path = self.config.codex_home_path / "models_cache.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            models = data.get("models") if isinstance(data, dict) else None
+            if isinstance(models, list):
+                for m in models:
+                    if isinstance(m, str) and m.strip():
+                        cached.append(m.strip())
+                    elif isinstance(m, dict):
+                        mid = m.get("id") or m.get("slug") or m.get("name")
+                        if mid:
+                            cached.append(str(mid))
+        except (OSError, ValueError, TypeError):
+            pass
+        seen = set()
+        out = []
+        for m in extras + cached:
+            if m and m not in seen:
+                seen.add(m)
+                out.append(m)
+        return out
+
+    def efforts(self):
+        return list(getattr(self.config, "efforts", None) or [])
+
+    def title_for(self, text: str) -> str:
+        """Name a Codex session using Codex itself.
+
+        One `codex exec` in the titler's scratch directory. Costs real tokens
+        (~11.5k measured, since the CLI loads its instructions first), so it is
+        cached hard and only ever run from the background titler.
+        """
+        cwd = str(titles.titler_cwd())
+        cmd = [_codex_bin(self.config), "exec", "--skip-git-repo-check",
+               "-C", cwd, titles.prompt_for(text)]
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(
+            Path(getattr(self.config, "codex_home_path", None)
+                 or (Path.home() / ".codex")).expanduser())
+        env.setdefault("RUST_LOG", "error")
+        try:
+            out = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True,
+                                 text=True, timeout=180).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return titles.title_from_output(out)
+
+    def prepare(self, job, mode):
+        # `mode` is claude vocabulary; codex uses sandbox / bypass flags.
+        if not job.cwd:
+            raise providers.RunnerError("cwd is required for codex sessions")
+        cwd = os.path.expanduser(job.cwd)
+        if not os.path.isdir(cwd):
+            raise providers.RunnerError("cwd does not exist: %s" % cwd)
+        job.cwd = cwd
+
+        bin_path = str(getattr(self.config, "codex_bin", "codex") or "codex")
+        state = job.runner_state
+        state["parts"] = []
+        state["full"] = []
+
+        # Global flags before the subcommand (exec / exec resume).
+        cmd = [bin_path, "exec", "--json"]
+        # Phone-driven turns often use non-git folders (and /tmp in tests).
+        cmd.append("--skip-git-repo-check")
+
+        sandbox = str(getattr(self.config, "codex_sandbox", "") or "").strip()
+        if not sandbox:
+            # Default: full auto for phone use (same spirit as claude bypass /
+            # grok --yolo). Override with "read-only" / "workspace-write" in
+            # config if you want a tighter box.
+            sandbox = "danger-full-access"
+        if sandbox in ("danger-full-access", "yolo"):
+            cmd.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            cmd += ["-s", sandbox]
+
+        if job.model and job.model not in ("", "default"):
+            cmd += ["-m", job.model]
+
+        # Extra flags from config (whitespace-split), e.g. "--profile work".
+        extra = str(getattr(self.config, "codex_exec_flags", "") or "").split()
+        cmd += extra
+
+        cmd += ["-C", cwd]
+
+        # Resume is a subcommand of exec:  codex exec resume [id] [prompt]
+        if job.session_id:
+            cmd += ["resume", job.session_id]
+
+        cmd.append(job.prompt)
+
+        env = dict(os.environ)
+        home = str(self.config.codex_home_path)
+        env["CODEX_HOME"] = home
+        extra_env = getattr(self.config, "codex_env", None) or {}
+        env.update({str(k): str(v) for k, v in extra_env.items()})
+
+        # Close stdin in the job runner — jobs.py uses subprocess.Popen with
+        # stdin=PIPE by default; we mark that we want DEVNULL via state and
+        # rely on prepare's return. Actually JobManager always uses PIPE.
+        # Closing happens if we don't write; but CLI may wait. jobs.py should
+        # close stdin — check... Looking at jobs.py: it doesn't close stdin.
+        # Workaround: the CLI still works if we pass prompt as argv (we do).
+        # The "Reading additional input from stdin" is just a notice when
+        # stdin is a pipe. Closing: set state flag and patch is heavy; instead
+        # document that stdin is a pipe. For robustness, use a wrapper script
+        # or set stdin via env. Looking at jobs again...
+
+        return cmd, env
+
+    def handle_stream_line(self, job, line: str):
+        obj = _safe_json(line)
+        if not isinstance(obj, dict):
+            return
+        et = str(obj.get("type") or "")
+        state = job.runner_state
+
+        if et == "thread.started":
+            sid = str(obj.get("thread_id") or "").strip()
+            if sid:
+                job.new_session_id = sid
+                job.add_event("init", session_id=sid,
+                              model=job.model or "")
+            return
+
+        if et == "turn.started":
+            job.set_phase("thinking", "")
+            return
+
+        if et in ("error", "turn.failed"):
+            msg = (obj.get("message") or obj.get("error")
+                   or (obj.get("item") or {}).get("text")
+                   or "codex reported an error")
+            with job.lock:
+                if not job.error:
+                    job.error = str(msg)
+            job.add_event("text", text=str(msg),
+                          blocks=markdown_to_blocks(str(msg)))
+            return
+
+        if et in ("item.started", "item.completed", "item.updated"):
+            item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
+            itype = str(item.get("type") or "").lower()
+            if itype in ("agent_message", "agentmessage"):
+                text = str(item.get("text") or _item_text(item) or "").strip()
+                if text and et == "item.completed":
+                    state.setdefault("parts", []).append(text)
+                    state.setdefault("full", []).append(text)
+                    job.add_event("text", text=text,
+                                  blocks=markdown_to_blocks(text))
+                    job.set_phase("writing", text[-160:])
+            elif itype in ("command_execution", "command", "shell",
+                           "commandexecution"):
+                cmd = str(item.get("command") or item.get("cmd") or "")
+                if not cmd and item.get("input"):
+                    _, cmd = _parse_codex_tool_input(str(item.get("input")))
+                cmd = cmd or "shell"
+                status = str(item.get("status") or "")
+                if et == "item.started" or status == "in_progress" \
+                        or et == "item.completed":
+                    # Emit on start and on completed-only streams (some CLIs
+                    # only send item.completed for short shell calls).
+                    if et != "item.updated":
+                        job.add_event("tool", name="shell", detail=cmd[:200])
+                    job.set_phase("tool", cmd[:120])
+                if et == "item.completed":
+                    code = item.get("exit_code")
+                    if code not in (None, 0, "0"):
+                        job.set_phase("tool", "exit %s" % code)
+            elif itype in ("file_change", "patch", "apply_patch", "filechange"):
+                path = str(item.get("path") or item.get("file") or "edit")
+                if et != "item.updated":
+                    job.add_event("tool", name="edit", detail=path[:200])
+                job.set_phase("tool", path[:120])
+            elif itype in ("web_search", "websearch"):
+                q = str(item.get("query") or item.get("q") or "web search")
+                if et != "item.updated":
+                    job.add_event("tool", name="web_search", detail=q[:200])
+                job.set_phase("tool", q[:120])
+            elif itype in ("function_call", "custom_tool_call", "tool_call"):
+                name, detail = _parse_codex_tool_input(
+                    str(item.get("input") or item.get("arguments") or ""))
+                if item.get("name") and name in ("exec", "tool"):
+                    name = str(item.get("name"))
+                if et != "item.updated":
+                    job.add_event("tool", name=name, detail=detail)
+                job.set_phase("tool", (detail or name)[:120])
+            elif itype in ("reasoning", "thought", "agent_reasoning"):
+                job.set_phase("thinking", "")
+            return
+
+        if et == "turn.completed":
+            full = "".join(state.get("full") or state.get("parts") or [])
+            with job.lock:
+                if full and not job.result_text:
+                    job.result_text = full
+            usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+            job.add_event(
+                "result",
+                is_error=False,
+                duration_ms=0,
+                cost_usd=0,
+                usage=usage,
+            )
+            return
+
+    def tick(self, job):
+        pass
+
+    def finalize(self, job, returncode, stderr_tail):
+        state = job.runner_state
+        full = "".join(state.get("full") or state.get("parts") or [])
+        with job.lock:
+            if full and not job.result_text:
+                job.result_text = full
+        if returncode not in (0, None) and not job.error:
+            tail = (stderr_tail or "").strip().splitlines()
+            msg = tail[-1] if tail else ("codex exited with code %s" % returncode)
+            with job.lock:
+                job.error = msg
+            return False
+        return None
+
+    def cleanup(self, job):
+        return

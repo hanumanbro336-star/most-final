@@ -1,0 +1,74 @@
+import Foundation
+
+/// App-wide settings (Android AppSettings parity — subset used on iOS).
+struct AppSettings: Codable, Equatable {
+    /// "" / "default" = daemon default for next turn.
+    var modelOverride: String = ""
+    var effortOverride: String = ""
+    /// interactive | headless (mapped to permissionMode on the wire).
+    /// Default interactive so new installs match Android/web (host TUI).
+    var permissionMode: String = "interactive"
+    var soundCues: Bool = true
+    var showAllSessions: Bool = false
+    /// system | light | dark
+    var theme: String = "system"
+    /// Sessions list shows only the daemon-side Focus list (toggled from the filter row).
+    var focusMode: Bool = false
+    /// Sessions with process view on: the transcript additionally shows the agent's working
+    /// steps (tool calls, results, thinking) under each message. Per session, off by default.
+    var processViewSessions: Set<String> = []
+
+    init() {}
+
+    /// Field-tolerant: a settings blob saved by an older build must not reset to defaults just
+    /// because a new field appeared.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        modelOverride = try c.decodeIfPresent(String.self, forKey: .modelOverride) ?? ""
+        effortOverride = try c.decodeIfPresent(String.self, forKey: .effortOverride) ?? ""
+        permissionMode = try c.decodeIfPresent(String.self, forKey: .permissionMode) ?? "interactive"
+        soundCues = try c.decodeIfPresent(Bool.self, forKey: .soundCues) ?? true
+        showAllSessions = try c.decodeIfPresent(Bool.self, forKey: .showAllSessions) ?? false
+        theme = try c.decodeIfPresent(String.self, forKey: .theme) ?? "system"
+        focusMode = try c.decodeIfPresent(Bool.self, forKey: .focusMode) ?? false
+        processViewSessions = try c.decodeIfPresent(Set<String>.self, forKey: .processViewSessions) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case modelOverride, effortOverride, permissionMode, soundCues
+        case showAllSessions, theme, focusMode, processViewSessions
+    }
+}
+
+@MainActor
+final class SettingsStore: ObservableObject {
+    @Published var settings: AppSettings {
+        didSet { save() }
+    }
+
+    private let key = "com.agentremote.settings"
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: key),
+           let decoded = try? JSONDecoder().decode(AppSettings.self, from: data) {
+            settings = decoded
+            // One-shot: older builds defaulted to headless; flip to interactive
+            // unless the user already changed settings after this migration.
+            let migratedKey = key + ".interactiveDefault"
+            if !UserDefaults.standard.bool(forKey: migratedKey) {
+                if settings.permissionMode == "headless" || settings.permissionMode.isEmpty {
+                    settings.permissionMode = "interactive"
+                }
+                UserDefaults.standard.set(true, forKey: migratedKey)
+            }
+        } else {
+            settings = AppSettings()
+        }
+    }
+
+    private func save() {
+        if let data = try? JSONEncoder().encode(settings) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+}
