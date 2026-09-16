@@ -156,7 +156,7 @@ export function PairingScreen() {
   const command = useMemo(() => {
     if (!appUrl || !session?.code) return ''
     if (platform === 'windows') {
-      return `$installer = Join-Path $env:TEMP 'forge-install.ps1'; try { Invoke-RestMethod '${appUrl}/install.ps1' -OutFile $installer; & $installer '${session.code}' } catch { Write-Error "Installer failed — is ${appUrl} public? $($_.Exception.Message)" }`
+      return `curl.exe -fsSL ${appUrl}/install.cmd -o "%TEMP%\\forge-install.cmd" && call "%TEMP%\\forge-install.cmd" ${session.code}`
     }
     return `curl -fsSL ${appUrl}/install -o /tmp/forge-install.sh && grep -q '^#!/usr/bin/env bash' /tmp/forge-install.sh && bash /tmp/forge-install.sh ${session.code} || echo "Installer fetch failed — is ${appUrl} public?"`
   }, [appUrl, platform, session?.code])
@@ -262,7 +262,7 @@ export function PairingScreen() {
                 onClick={() => setPlatform('windows')}
                 aria-pressed={platform === 'windows'}
               >
-                Windows
+                Windows CMD
               </Button>
               <Button
                 size="sm"
@@ -292,7 +292,7 @@ export function PairingScreen() {
           Copy the command
         </Step>
         <Step n={3} done={status === 'claimed' || connected} active={status === 'waiting'}>
-          Paste it in a terminal on the laptop
+          {platform === 'windows' ? 'Paste it in Command Prompt (cmd.exe)' : 'Paste it in a terminal on the laptop'}
         </Step>
         <Step n={4} done={connected} active={status === 'claimed' || status === 'waiting'} highlight>
           {connected

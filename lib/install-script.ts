@@ -150,6 +150,35 @@ echo "Logs: \$FORGE_HOME/bridge.log"
 `
 }
 
+export function windowsCmdInstallScript(origin: string) {
+  const safeOrigin = origin.replace(/[\r\n"&|<>^%!]/g, '')
+  return String.raw`@echo off
+setlocal
+set "FORGE_ORIGIN=${safeOrigin}"
+set "FORGE_INSTALLER=%TEMP%\forge-install-%RANDOM%.ps1"
+
+where curl.exe >nul 2>&1 || (
+  echo curl.exe is required. Install a current version of Windows, then try again.
+  exit /b 1
+)
+where powershell.exe >nul 2>&1 || (
+  echo Windows PowerShell is required by the installer.
+  exit /b 1
+)
+
+curl.exe -fsSL "%FORGE_ORIGIN%/install.ps1" -o "%FORGE_INSTALLER%"
+if errorlevel 1 (
+  echo Installer download failed. Make sure %FORGE_ORIGIN% is public.
+  exit /b 1
+)
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%FORGE_INSTALLER%" %*
+set "FORGE_EXIT=%ERRORLEVEL%"
+del /q "%FORGE_INSTALLER%" >nul 2>&1
+exit /b %FORGE_EXIT%
+`
+}
+
 export function windowsInstallScript(origin: string, relayUrl: string) {
   const safeOrigin = origin.replace(/['\r\n]/g, '')
   const safeRelay = relayUrl.replace(/['\r\n]/g, '')
